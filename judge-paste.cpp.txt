@@ -1313,9 +1313,114 @@ if (!edited) break;
 }
 if (improved) recordLinks(links);
 }
+void rerouteArcs(Clock::time_point stop) {
+struct Arc { int offset, edges, saving; };
+std::vector<int> occupied(p.n), previous(4 * p.n), depth(4 * p.n), work;
+work.reserve(4 * p.n);
+int attempts = 0;
+while (Clock::now() < stop && attempts < 120) {
+const auto loop = loopOrder();
+const int length = int(loop.size());
+auto at = [&](int k) { return loop[(k + length) % length]; };
+std::vector<Arc> arcs;
+for (int i = 0; i < length; ++i) occupied[loop[i]] = 1;
+for (int i = 0; i < length; ++i) {
+if (p.clues[at(i - 1)] == '.' && p.clues[at(i)] == '.' && i % 4) continue;
+for (int steps = 1; steps <= std::min(140, length - 2); ++steps) {
+const int b = at(i + steps);
+const bool pearl = p.clues[b] != '.';
+if (steps >= 3 && (pearl || p.clues[at(i + steps + 1)] != '.' || steps % 4 == 0)) {
+const int saving = steps - manhattan(at(i), b);
+if (saving >= 2) arcs.push_back({i, steps, saving});
+}
+if (pearl) break;
+}
+}
+std::sort(arcs.begin(), arcs.end(), [](const Arc& a, const Arc& b) {
+return a.saving > b.saving;
+});
+bool improved = false;
+for (const Arc& arc : arcs) {
+if (attempts++ >= 120 || Clock::now() >= stop) break;
+const int a = at(arc.offset), b = at(arc.offset + arc.edges);
+auto direction = [&](int i, int j) {
+return int(std::find(p.adj[i].begin(), p.adj[i].end(), j) - p.adj[i].begin());
+};
+const int beforeA = at(arc.offset - 1), afterB = at(arc.offset + arc.edges + 1);
+const int enter = direction(a, beforeA), exit = direction(b, afterB);
+auto straight = [&](int i) { return best[i] == '-' || best[i] == '|'; };
+auto requiredNeighbor = [&](int pearl, int fixedNeighbor) {
+if (p.clues[pearl] == 'B') return Straight;
+if (p.clues[pearl] == 'W' && straight(fixedNeighbor)) return Turn;
+return All;
+};
+const int firstMask = requiredNeighbor(a, beforeA);
+const int lastMask = requiredNeighbor(b, afterB);
+const int startMask = requiredNeighbor(beforeA, at((arc.offset + length - 2) % length));
+const int endMask = requiredNeighbor(afterB, at(arc.offset + arc.edges + 2));
+for (int k = 1; k < arc.edges; ++k) occupied[at(arc.offset + k)] = 0;
+std::fill(previous.begin(), previous.end(), -2);
+work.clear();
+const int source = 4 * a + enter;
+previous[source] = -1;
+depth[source] = 0;
+work.push_back(source);
+int target = -1;
+for (size_t k = 0; k < work.size(); ++k) {
+const int node = work[k], i = node / 4, in = node % 4;
+if (i == b) {
+if (in != exit && (domain[b] & endMask & p.uses[in] & p.uses[exit])) {
+target = node;
+break;
+}
+continue;
+}
+int mask = domain[i] & p.uses[in];
+if (node == source) mask &= startMask;
+if (depth[node] == 1) mask &= firstMask;
+const int allowedEdges = p.possible[mask];
+for (int d = 0; d < 4; ++d) {
+if (d == in || !(allowedEdges & (1 << d))) continue;
+const int j = p.adj[i][d];
+if ((occupied[j] && j != b) || depth[node] + 1 + manhattan(j, b) >= arc.edges)
+continue;
+if (j == b && !(mask & lastMask & p.uses[d])) continue;
+if (node == source && j == b &&
+!(domain[b] & firstMask & endMask & p.uses[opposite(d)] & p.uses[exit]))
+continue;
+const int next = 4 * j + opposite(d);
+if (previous[next] != -2) continue;
+previous[next] = node;
+depth[next] = depth[node] + 1;
+work.push_back(next);
+}
+}
+for (int k = 1; k < arc.edges; ++k) occupied[at(arc.offset + k)] = 1;
+if (target < 0) continue;
+std::vector<int> links(p.n);
+for (int i : loop) links[i] = Edges[std::find(Glyph, Glyph + States, best[i]) - Glyph];
+for (int k = 1; k < arc.edges; ++k) links[at(arc.offset + k)] = 0;
+links[b] = (1 << exit) | (1 << (target % 4));
+for (int node = target; previous[node] >= 0; node = previous[node]) {
+const int predecessor = previous[node];
+links[predecessor / 4] = (1 << (predecessor % 4)) | (1 << opposite(node % 4));
+}
+const int before = bestLength;
+recordLinks(links);
+if (bestLength < before) {
+improved = true;
+break;
+}
+}
+if (!improved) break;
+std::fill(occupied.begin(), occupied.end(), 0);
+}
+}
 void optimize(double stop, double hardStop) {
 setDeadline(stop);
 if (bestLength > geometricBound && elapsed() + 0.015 < stop) shortcut();
+if (p.n >= 600 && bestLength > geometricBound && elapsed() + 0.025 < stop)
+rerouteArcs(std::min(deadline, Clock::now() + std::chrono::milliseconds(115)));
 if (p.n <= 100) {
 if (search(12000, 0, false) == Exhausted) return;
 }
@@ -1347,14 +1452,24 @@ offset = candidate;
 const int previousBest = bestLength;
 const size_t mark = trail.size();
 bool consistent = true;
-if (++attempt % 9 != 0) {
+const bool spatial = p.n >= 600 && attempt % 4 == 2;
+++attempt;
+if (spatial) {
+const int center = loop[(offset + width / 2) % length];
+const int radius = 3 + int(rng() % 7);
+for (int i : loop) {
+if (manhattan(i, center) <= radius) continue;
+const int state = int(std::find(Glyph, Glyph + States, best[i]) - Glyph);
+if (!narrow(i, 1 << state)) { consistent = false; break; }
+}
+} else if (attempt % 9 != 0) {
 for (int k = width; k < length; ++k) {
 const int i = loop[(offset + k) % length];
 const int state = int(std::find(Glyph, Glyph + States, best[i]) - Glyph);
 if (!narrow(i, 1 << state)) { consistent = false; break; }
 }
 }
-if (consistent) search(attempt % 9 ? 160 : 1000, attempt % 3, true);
+if (consistent) search(spatial ? 110 : attempt % 9 ? 160 : 1000, attempt % 3, true);
 restore(mark);
 unsuccessful = bestLength < previousBest ? 0 : unsuccessful + 1;
 const double now = elapsed();
